@@ -89,12 +89,17 @@ function checkShots(shots: string[]): void {
 function printSummary(snapshot: ReturnType<typeof parseSnapshot>, board: ReturnType<typeof buildRadar>['board'], radar: ReturnType<typeof buildRadar>['radar'], out: string, shots: string[]): void {
   const top = board
     .slice(0, 5)
-    .map((r) => `  #${r.rank} ${r.name} ${shortUsd(r.implied_value_usd)} (TVL ${shortUsd(r.tvl_usd)}, ${r.model.multiple.toFixed(4)}x ${r.category ?? 'Other'})`)
+    .map((r) => `  #${r.rank} ${r.name} ${shortUsd(r.implied_value_usd)} (TVL ${shortUsd(r.tvl_usd)}, ${r.model.multiple.toFixed(4)}x ${r.category ?? 'Other'}, signal ${r.model.signal_multiplier.toFixed(2)}x, TVL z ${r.model.tvl_z.toFixed(2)}, growth z ${r.model.growth_z.toFixed(2)}${r.model.catalyst !== null ? `, catalyst ${r.model.catalyst}` : ''})`)
+    .join('\n');
+  const conviction = radar.conviction
+    .slice(0, 3)
+    .map((c) => `  #${c.rank} ${c.thesis}`)
     .join('\n');
   process.stdout.write(
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
       `token radar: comps from ${radar.global_comps} live protocols, global multiple ${radar.global_multiple}x, ${radar.comps.length} categories with own comps\n` +
       `token radar: top 5 implied values:\n${top}\n` +
+      `token radar: top 3 conviction:\n${conviction}\n` +
       `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
   );
 }
@@ -116,7 +121,7 @@ function main(): void {
   }
 
   mkdirSync(out, { recursive: true });
-  writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
+  writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board, conviction: radar.conviction })}\n`);
   writeFileSync(join(out, 'data.js'), dataScript(radar));
 
   copyDir(join(here, 'dashboard'), join(out, 'dashboard'));
