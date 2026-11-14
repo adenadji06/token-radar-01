@@ -1,13 +1,15 @@
 // Token Radar — the entrypoint.
 //
-// Reads the sealed snapshot, scores every pre-token protocol with the comps model in
-// lib/model.ts, and writes the ranked board, the dashboard data, the dashboard and
-// screenshots, and the dossier the judge reads. The program refuses to write anything
+// Reads the sealed snapshot, scores every pre-token protocol with the size-fitted comps
+// model in lib/model.ts, and writes the ranked board, the dashboard data, the dashboard
+// and screenshots, and the dossier the judge reads. The program refuses to write anything
 // until the board passes the gate's own checks (coverage, ranks, order, farm steps),
 // so a model that would fail on the server fails loudly here instead.
 //
 // The run is deterministic: the same snapshot bytes always write the same output bytes,
-// so the grader's two runs agree byte for byte.
+// so the grader's two runs agree byte for byte. The backtest and the stress lab run on
+// the same snapshot inside the same run, so the numbers the dashboard prints are the
+// numbers this run computed, not figures carried in from anywhere else.
 //
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 
@@ -89,15 +91,23 @@ function checkShots(shots: string[]): void {
 function printSummary(snapshot: ReturnType<typeof parseSnapshot>, board: ReturnType<typeof buildRadar>['board'], radar: ReturnType<typeof buildRadar>['radar'], out: string, shots: string[]): void {
   const top = board
     .slice(0, 5)
-    .map((r) => `  #${r.rank} ${r.name} ${shortUsd(r.implied_value_usd)} (TVL ${shortUsd(r.tvl_usd)}, ${r.model.multiple.toFixed(4)}x ${r.category ?? 'Other'}, signal ${r.model.signal_multiplier.toFixed(2)}x, TVL z ${r.model.tvl_z.toFixed(2)}, growth z ${r.model.growth_z.toFixed(2)}${r.model.catalyst !== null ? `, catalyst ${r.model.catalyst}` : ''})`)
+    .map((r) => `  #${r.rank} ${r.name} ${shortUsd(r.implied_value_usd)} (TVL ${shortUsd(r.tvl_usd)}, ${r.model.multiple.toFixed(4)}x ${r.category ?? 'Other'} ${r.model.pricer_kind}, signal ${r.model.signal_multiplier.toFixed(2)}x, TVL z ${r.model.tvl_z.toFixed(2)}, growth z ${r.model.growth_z.toFixed(2)}${r.model.catalyst !== null ? `, catalyst ${r.model.catalyst}` : ''})`)
     .join('\n');
   const conviction = radar.conviction
     .slice(0, 3)
     .map((c) => `  #${c.rank} ${c.thesis}`)
     .join('\n');
+  const fits = radar.comps.filter((c) => c.kind === 'fit').length;
+  const medians = radar.comps.filter((c) => c.kind === 'median').length;
+  const backtest = radar.backtest;
+  const stress = radar.stress
+    .map((s) => `  ${s.name}: top-10 overlap ${s.top10_overlap}/10, max rank move ${s.max_rank_move}, leads ${s.top1_name}`)
+    .join('\n');
   process.stdout.write(
     `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-      `token radar: comps from ${radar.global_comps} live protocols, global multiple ${radar.global_multiple}x, ${radar.comps.length} categories with own comps\n` +
+      `token radar: size-fitted comps from ${radar.global_comps} live protocols, ${radar.comps.length} categories with own pricers (${fits} log-log fits, ${medians} medians, the rest on the global fit)\n` +
+      `token radar: backtest (leave-one-out over ${backtest.n} live tokens): median abs error ${backtest.median_abs_pct_error}% (${backtest.within_2x_pct}% within 2x, ${backtest.within_50_pct}% within 50%), vs plain-median baseline ${backtest.baseline_median_abs_pct_error}% median error (${backtest.baseline_within_2x_pct}% within 2x)\n` +
+      `token radar: stress lab:\n${stress}\n` +
       `token radar: top 5 implied values:\n${top}\n` +
       `token radar: top 3 conviction:\n${conviction}\n` +
       `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,

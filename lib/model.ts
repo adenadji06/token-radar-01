@@ -4,34 +4,44 @@
 // runs in four stages, each a pure function of the snapshot it is given:
 //
 //   1. parse   — the file's text becomes a Snapshot, or the run stops with a SnapshotError.
-//   2. price   — every category gets a comparable multiple from the live-token protocols in it,
-//                and every category gets sector statistics (z-scores) from its own figures.
+//   2. price   — every category gets a size-fitted comparable price from the live-token
+//                protocols in it, and every category gets sector statistics (z-scores) from
+//                its own figures. The fit is checked by a leave-one-out backtest over the
+//                live market itself, and the ranking is stressed against the model's own
+//                assumptions before it is handed in.
 //   3. score   — every pre-token protocol gets one implied value from the snapshot's figures:
-//                the comps multiple, then a signal factor from sector-relative z-scores, the
-//                seven-day momentum against its own sector, and a catalyst flag.
-//   4. plan    — every ranked row gets a seven-step farm plan derived from its own record,
-//                each step carrying a concrete cost, a time and an expected value, the value
-//                steps ordered by expected value, highest first.
+//                the size-fitted comps price, then a signal factor from sector-relative
+//                z-scores, the seven-day momentum against its own sector, and a catalyst flag.
+//   4. plan    — every ranked row gets an eight-step farm plan derived from its own record
+//                and its category's mechanism, each step carrying a concrete cost, a time
+//                and an expected value, the value steps ordered by expected value, highest first.
 //
-// The board always covers the snapshot's whole watchlist and then adds the early radar: the
-// pre-token protocols below the watchlist floor, strongest TVL first, up to EARLY_ROWS. The
-// live-token protocols are never ranked; they are the market that prices the board, and the
-// dashboard shows them apart with their market caps.
+// The board is the snapshot's whole pre-token set under the house's own watchlist rule,
+// applied at any TVL: a protocol that records no token and is not a wrapped, staked or
+// bridged product of a token that already trades. The rule is the same one that drew the
+// 40-protocol watchlist at the $50M floor; this board drops the floor and keeps the rule,
+// so the watchlist is covered and the early radar is every other protocol the rule keeps.
+// The live-token protocols are never ranked; they are the market that prices the board,
+// and the dashboard shows them apart with their market caps.
 //
-// Nothing in the model names a protocol. The same code scores every row, and the comparables
-// table the dashboard prints is computed from this same snapshot while the program runs.
-// The sector statistics are computed the same way: a protocol's z-scores are measured
-// against the other protocols in its own category, never against a hand-kept list.
+// Nothing in the model names a protocol. The same code scores every row, and the
+// comparables table, the backtest and the stress lab the dashboard prints are computed
+// from this same snapshot while the program runs. The sector statistics are computed the
+// same way: a protocol's z-scores are measured against the other protocols in its own
+// category, never against a hand-kept list.
 //
 // The model, in one line per factor (the dashboard prints the same formula):
 //
-//   multiple   median mcap/TVL of the live protocols in the row's category (3+ comps),
-//              else the global median; clamped to [multiple_floor, multiple_cap]
-//   base       tvl_usd * multiple
+//   fit        log10(mcap) = a + b * log10(tvl), fitted by least squares on the live-token
+//              protocols of the row's category (5+ comps); the category median mcap/TVL
+//              where comps are thin (3-4); the global log-log fit where thinner still
+//   multiple   the fitted multiple at the row's own TVL (base / tvl_usd), clamped to
+//              [multiple_floor, multiple_cap]
+//   base       tvl_usd * multiple (the size-fitted comparables price)
 //   growth     clamp(change_7d, growth_floor, growth_cap), in per cent
 //   growthMult 1 + (growth / 100) * growth_weight
 //   maturity   maturity_floor + min(age_days, maturity_days) / maturity_days * maturity_range
-//              (age unknown: unknown_age_days; age is days since listed_at)
+//              (age unknown: unknown_age_days; age is days since listed_at; 1 when off)
 //   reach      1 + min(chains - 1, reach_max_chains) * reach_step
 //   tvl_z      z-score of log10(tvl_usd) among the pre-token protocols of its category
 //   growth_z   z-score of the winsorised change_7d against its category's median and MAD
@@ -81,6 +91,9 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   min_comps: number;
+  min_fit_comps: number;
+  multiple_scale: number;
+  maturity_off: boolean;
   reach_step: number;
   reach_max_chains: number;
   signal_tvl: number;
@@ -109,6 +122,9 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.05,
   multiple_cap: 1.0,
   min_comps: 3,
+  min_fit_comps: 5,
+  multiple_scale: 1,
+  maturity_off: false,
   reach_step: 0.02,
   reach_max_chains: 4,
   signal_tvl: 0.12,
@@ -127,10 +143,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3-signals';
-
-/** Early rows carried below the watchlist floor, by TVL. */
-export const EARLY_ROWS = 206;
+export const MODEL_VERSION = 'radar-4-sizefit-backtest';
 
 /** Live-token protocols the dashboard's Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -162,6 +175,9 @@ export interface BoardRow {
   model: {
     multiple: number;
     comps_n: number;
+    pricer_kind: string;
+    fit_slope: number | null;
+    fit_r2: number | null;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -192,6 +208,9 @@ export interface RadarRow {
   implied_value_usd: number;
   multiple: number;
   comps_n: number;
+  pricer_kind: string;
+  fit_slope: number | null;
+  fit_r2: number | null;
   growth_multiplier: number;
   maturity_multiplier: number;
   reach_multiplier: number;
@@ -214,10 +233,13 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** One category's comparable multiple, as the dashboard's comps table shows it. */
+/** One category's comparable price, as the dashboard's comps table shows it. */
 export interface CategoryComp {
   category: string;
   comps: number;
+  kind: string;
+  slope: number | null;
+  r2: number | null;
   multiple: number;
 }
 
@@ -227,6 +249,24 @@ export interface ConvictionEntry {
   slug: string;
   name: string;
   thesis: string;
+}
+
+/** The leave-one-out backtest of the pricing method against the live market itself. */
+export interface BacktestResult {
+  n: number;
+  median_abs_pct_error: number;
+  within_2x_pct: number;
+  within_50_pct: number;
+  baseline_median_abs_pct_error: number;
+  baseline_within_2x_pct: number;
+}
+
+/** One stress scenario: how the top ten survives a change of assumption. */
+export interface StressScenario {
+  name: string;
+  top10_overlap: number;
+  max_rank_move: number;
+  top1_name: string;
 }
 
 /** Everything the dashboard renders, built from one snapshot. */
@@ -243,6 +283,8 @@ export interface RadarData {
   global_multiple: number;
   global_comps: number;
   comps: CategoryComp[];
+  backtest: BacktestResult;
+  stress: StressScenario[];
   rows: RadarRow[];
   live: LiveRow[];
   conviction: ConvictionEntry[];
@@ -409,14 +451,34 @@ export function parseSnapshot(text: string): Snapshot {
 /** A name ending in a release marker (V2, v2, 2.0, …) is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
+/** A name carrying a whole word wrapped, staked or staking is a product of a token that trades. */
+const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
+
+/** Categories the watchlist rule excludes: bridges, liquid staking and exchanges. */
+const EXCLUDED_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
+
+/** Names beginning with an exchange's name are that exchange's product, not a launch of its own. */
+const EXCHANGE_PREFIXES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
+
 /** A protocol records no token when all three token fields are null. */
 export function isPreToken(p: SnapshotProtocol): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
 }
 
-/** A protocol the board may rank: pre-token, not an exchange, not a versioned pool. */
-export function isRankable(p: SnapshotProtocol): boolean {
-  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+/**
+ * A protocol the board ranks: the house's own watchlist rule, applied at any TVL. The
+ * watchlist is the 40 protocols this rule keeps at or above the $50M floor; the board is
+ * every protocol the rule keeps, floor or no floor. A wrapped, staked or bridged product
+ * of a token that already trades is not a token that does not exist yet, so the rule
+ * leaves those out wherever they sit.
+ */
+export function isBoardRow(p: SnapshotProtocol): boolean {
+  if (!isPreToken(p)) return false;
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
+  if (VERSIONED.test(p.name)) return false;
+  if (WRAPPED_WORD.test(p.name)) return false;
+  if (EXCHANGE_PREFIXES.some((e) => p.name.startsWith(e))) return false;
+  return true;
 }
 
 /** The snapshot's protocols indexed by slug. */
@@ -428,10 +490,61 @@ function indexBySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtoco
 
 /* ------------------------------------------------------------ stage 2: price -- */
 
-/** The comparable multiples of one snapshot: per category, and one global fallback. */
-export interface Multiples {
-  byCategory: Map<string, { multiple: number; comps: number }>;
-  global: { multiple: number; comps: number };
+/** One least-squares fit of log10(market cap) on log10(TVL), or null when it cannot be fit. */
+export interface Fit {
+  a: number;
+  b: number;
+  r2: number;
+  n: number;
+}
+
+/** The least-squares line through `points`, with its R-squared; null on too few points or no spread. */
+export function fitLogLog(points: Array<{ x: number; y: number }>): Fit | null {
+  const n = points.length;
+  if (n < 2) return null;
+  let mx = 0;
+  let my = 0;
+  for (const p of points) {
+    mx += p.x;
+    my += p.y;
+  }
+  mx /= n;
+  my /= n;
+  let sxx = 0;
+  let sxy = 0;
+  let syy = 0;
+  for (const p of points) {
+    const dx = p.x - mx;
+    const dy = p.y - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+    syy += dy * dy;
+  }
+  if (sxx <= 0 || syy <= 0) return null;
+  const b = sxy / sxx;
+  const a = my - b * mx;
+  let ssr = 0;
+  for (const p of points) {
+    const r = p.y - (a + b * p.x);
+    ssr += r * r;
+  }
+  return { a, b, r2: Math.max(0, 1 - ssr / syy), n };
+}
+
+/** How one category is priced: a size fit, a category median, or the global fit. */
+export interface Pricer {
+  kind: 'fit' | 'median' | 'global-fit';
+  n: number;
+  slope: number | null;
+  intercept: number | null;
+  r2: number | null;
+  medianMultiple: number;
+}
+
+/** The comparable pricers of one snapshot: per category, and one global fallback. */
+export interface Pricers {
+  byCategory: Map<string, Pricer>;
+  global: Pricer;
 }
 
 /** Keep a multiple inside the model's band. */
@@ -440,42 +553,123 @@ function bandMultiple(x: number, model: ModelConstants): number {
 }
 
 /**
- * For each category, the median market-cap / TVL of its live-token protocols, when at least
- * `min_comps` of them exist; the global median across every live protocol otherwise. The
- * market itself prices each category, and the snapshot alone is the source.
+ * For each category, a size-fitted comparable price from its live-token protocols: a
+ * log-log least-squares fit of market cap on TVL when at least `min_fit_comps` of them
+ * exist, the category median mcap/TVL when at least `min_comps` exist, and the global
+ * log-log fit across every live protocol otherwise. A plain median multiple prices a
+ * $5M protocol and a $2B protocol at the same ratio; the market does not — larger
+ * protocols trade at a different multiple of TVL than small ones — so the fit lets the
+ * multiple bend with size, and the R-squared says how much of the category the fit
+ * actually explains. `excludeSlug` leaves one protocol out, for the backtest.
  */
-export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): Multiples {
-  const perCategory = new Map<string, number[]>();
-  const all: number[] = [];
+export function buildPricers(snapshot: Snapshot, excludeSlug: string | null = null, model: ModelConstants = MODEL): Pricers {
+  const perCategory = new Map<string, SnapshotProtocol[]>();
+  const all: SnapshotProtocol[] = [];
   for (const p of snapshot.protocols) {
+    if (p.slug === excludeSlug) continue;
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    const ratio = p.mcap_usd / p.tvl_usd;
-    if (!Number.isFinite(ratio)) continue;
-    all.push(ratio);
+    all.push(p);
     const key = p.category ?? 'Other';
     const bucket = perCategory.get(key);
-    if (bucket !== undefined) bucket.push(ratio);
-    else perCategory.set(key, [ratio]);
+    if (bucket !== undefined) bucket.push(p);
+    else perCategory.set(key, [p]);
   }
-  all.sort((a, b) => a - b);
-  const globalMedian = medianOf(all);
-  const global = {
-    multiple: bandMultiple(globalMedian ?? 0.25, model),
-    comps: all.length,
-  };
-  const byCategory = new Map<string, { multiple: number; comps: number }>();
-  for (const [key, ratios] of perCategory) {
-    ratios.sort((a, b) => a - b);
-    if (ratios.length < model.min_comps) continue;
-    const mid = medianOf(ratios);
-    byCategory.set(key, { multiple: bandMultiple(mid ?? global.multiple, model), comps: ratios.length });
+  const globalFit = fitLogLog(all.map((p) => ({ x: Math.log10(p.tvl_usd), y: Math.log10(p.mcap_usd as number) })));
+  const globalMedian = medianOf(all.map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b));
+  const global: Pricer =
+    globalFit !== null
+      ? { kind: 'global-fit', n: all.length, slope: round4(globalFit.b), intercept: round4(globalFit.a), r2: round4(globalFit.r2), medianMultiple: bandMultiple(globalMedian ?? 0.25, model) }
+      : { kind: 'median', n: all.length, slope: null, intercept: null, r2: null, medianMultiple: bandMultiple(globalMedian ?? 0.25, model) };
+  const byCategory = new Map<string, Pricer>();
+  for (const [key, comps] of perCategory) {
+    const ratios = comps.map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
+    const med = medianOf(ratios);
+    if (comps.length >= model.min_fit_comps) {
+      const fit = fitLogLog(comps.map((p) => ({ x: Math.log10(p.tvl_usd), y: Math.log10(p.mcap_usd as number) })));
+      if (fit !== null) {
+        byCategory.set(key, { kind: 'fit', n: comps.length, slope: round4(fit.b), intercept: round4(fit.a), r2: round4(fit.r2), medianMultiple: bandMultiple(med ?? global.medianMultiple, model) });
+        continue;
+      }
+    }
+    if (comps.length >= model.min_comps) {
+      byCategory.set(key, { kind: 'median', n: comps.length, slope: null, intercept: null, r2: null, medianMultiple: bandMultiple(med ?? global.medianMultiple, model) });
+    }
   }
   return { byCategory, global };
 }
 
-/** The multiple one category gets: its own comps when it has them, else the global median. */
-export function multipleFor(category: string | null, multiples: Multiples): { multiple: number; comps: number } {
-  return multiples.byCategory.get(category ?? 'Other') ?? multiples.global;
+/** The pricer one category gets: its own when it has one, else the global fit. */
+export function pricerFor(category: string | null, pricers: Pricers): Pricer {
+  return pricers.byCategory.get(category ?? 'Other') ?? pricers.global;
+}
+
+/** One protocol's size-fitted comparables price: its base value and its effective multiple. */
+export interface PricedBase {
+  base: number;
+  multiple: number;
+  pricer: Pricer;
+}
+
+/**
+ * The base value of one protocol under its pricer. A fitted pricer reads the multiple off
+ * the log-log line at the protocol's own TVL, so a large protocol is priced at the
+ * multiple large live protocols actually carry; a median pricer uses the category median.
+ * The stress lab's `multiple_scale` multiplies the multiple before the band, so a shock
+ * moves every row but the band keeps the capped ones capped.
+ */
+export function priceBase(p: SnapshotProtocol, pricers: Pricers, model: ModelConstants): PricedBase {
+  const pricer = pricerFor(p.category, pricers);
+  let multiple: number;
+  if ((pricer.kind === 'fit' || pricer.kind === 'global-fit') && pricer.slope !== null && pricer.intercept !== null) {
+    const logTvl = Math.log10(Math.max(1, p.tvl_usd));
+    multiple = Math.pow(10, pricer.intercept + pricer.slope * logTvl) / p.tvl_usd;
+  } else {
+    multiple = pricer.medianMultiple;
+  }
+  multiple = bandMultiple(multiple * model.multiple_scale, model);
+  return { base: p.tvl_usd * multiple, multiple, pricer };
+}
+
+/**
+ * The leave-one-out backtest: every live-token protocol is priced by the method trained
+ * on the other live protocols, and the prediction is scored against the market cap the
+ * market actually gave it. The same loop prices the plain median-multiple method, so the
+ * dashboard can say whether the size fit earns its keep. Nothing here touches a board
+ * row: the backtest is a check on the pricing method, run on the market that prices it.
+ */
+export function backtestPricing(snapshot: Snapshot, model: ModelConstants = MODEL): BacktestResult {
+  const live = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const errs: number[] = [];
+  const baseErrs: number[] = [];
+  let within2 = 0;
+  let within50 = 0;
+  let baseWithin2 = 0;
+  for (const p of live) {
+    const actual = p.mcap_usd as number;
+    const pricers = buildPricers(snapshot, p.slug, model);
+    const { base } = priceBase(p, pricers, model);
+    const err = Math.abs(base - actual) / actual;
+    errs.push(err);
+    if (base >= 0.5 * actual && base <= 2 * actual) within2++;
+    if (err <= 0.5) within50++;
+    // The baseline: the plain median-multiple method, same leave-one-out training set.
+    const cat = pricers.byCategory.get(p.category ?? 'Other');
+    const baseMultiple = cat !== undefined ? cat.medianMultiple : pricers.global.medianMultiple;
+    const basePred = p.tvl_usd * baseMultiple;
+    baseErrs.push(Math.abs(basePred - actual) / actual);
+    if (basePred >= 0.5 * actual && basePred <= 2 * actual) baseWithin2++;
+  }
+  errs.sort((a, b) => a - b);
+  baseErrs.sort((a, b) => a - b);
+  const pct = (n: number, d: number): number => Math.round((n / Math.max(1, d)) * 1000) / 10;
+  return {
+    n: live.length,
+    median_abs_pct_error: Math.round((medianOf(errs) ?? 1) * 1000) / 10,
+    within_2x_pct: pct(within2, live.length),
+    within_50_pct: pct(within50, live.length),
+    baseline_median_abs_pct_error: Math.round((medianOf(baseErrs) ?? 1) * 1000) / 10,
+    baseline_within_2x_pct: pct(baseWithin2, live.length),
+  };
 }
 
 /* ----------------------------------------------------- stage 2b: sector stats -- */
@@ -556,6 +750,9 @@ export interface Score {
   implied: number;
   multiple: number;
   comps: number;
+  pricerKind: string;
+  fitSlope: number | null;
+  fitR2: number | null;
   growthPct: number;
   growthMult: number;
   maturityMult: number;
@@ -595,13 +792,13 @@ export function catalystLabel(catalyst: string | null, protocol: SnapshotProtoco
  * written in the same order the dashboard's formula prints it, so the page's recomputation
  * lands on the same number board.json carries. The signal factor is the break from the
  * comps-only model: a protocol that is large for its own sector, growing faster than its
- * sector, or carrying a catalyst earns a higher implied value than its category median
+ * sector, or carrying a catalyst earns a higher implied value than its category price
  * alone would give it, and a protocol small and shrinking for its sector earns less.
  */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  multiples: Multiples,
+  pricers: Pricers,
   stats: Map<string, SectorStats>,
   globalLogMean: number | null,
   globalLogSd: number | null,
@@ -612,10 +809,10 @@ export function impliedValue(
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const cappedAge = clamp(ageForModel, 0, model.maturity_days);
-  const maturityMult = model.maturity_floor + (cappedAge / model.maturity_days) * model.maturity_range;
+  const maturityMult = model.maturity_off ? 1 : model.maturity_floor + (cappedAge / model.maturity_days) * model.maturity_range;
   const extraChains = clamp(protocol.chains.length - 1, 0, model.reach_max_chains);
   const reachMult = 1 + extraChains * model.reach_step;
-  const { multiple, comps } = multipleFor(protocol.category, multiples);
+  const { base, multiple, pricer } = priceBase(protocol, pricers, model);
 
   const sector = stats.get(protocol.category ?? 'Other');
   const growthW = winsorGrowth(protocol.change_7d, model);
@@ -633,9 +830,26 @@ export function impliedValue(
       model.signal_cap,
     ),
   );
-  const base = protocol.tvl_usd * multiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult * reachMult * signalMult));
-  return { implied, multiple, comps, growthPct, growthMult, maturityMult, reachMult, signalMult, tvlZ, growthZ, sectorZ, momentumPct, catalyst, age };
+  return {
+    implied,
+    multiple,
+    comps: pricer.n,
+    pricerKind: pricer.kind,
+    fitSlope: pricer.slope,
+    fitR2: pricer.r2,
+    growthPct,
+    growthMult,
+    maturityMult,
+    reachMult,
+    signalMult,
+    tvlZ,
+    growthZ,
+    sectorZ,
+    momentumPct,
+    catalyst,
+    age,
+  };
 }
 
 /** The global log-ratio mean and sd across every live protocol, for the sector z-score. */
@@ -653,12 +867,6 @@ export function globalLogStats(snapshot: Snapshot): { mean: number | null; sd: n
 function byValue(a: { implied: number; tvl: number; slug: string }, b: { implied: number; tvl: number; slug: string }): number {
   if (a.implied !== b.implied) return b.implied - a.implied;
   if (a.tvl !== b.tvl) return b.tvl - a.tvl;
-  return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
-}
-
-/** Compare two protocols by TVL, then slug: how the early radar picks its rows. */
-function byTvl(a: SnapshotProtocol, b: SnapshotProtocol): number {
-  if (a.tvl_usd !== b.tvl_usd) return b.tvl_usd - a.tvl_usd;
   return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
 }
 
@@ -742,6 +950,48 @@ export function actionFor(p: SnapshotProtocol, capital: number, chain: string): 
   return defaultAction(p.name, capital, chain);
 }
 
+/** One category mechanism: how the protocol earns, and the risk that mechanism carries. */
+interface MechanismRule {
+  words: string[];
+  mechanism: string;
+  risk: string;
+}
+
+/**
+ * The mechanism rules, in the same order as the action rules, so the action, the
+ * mechanism and the risk of one plan always agree with each other. The mechanism says
+ * how the protocol earns the money a future token might share; the risk is the one
+ * check that mechanism demands every week, with the threshold that says to stop.
+ */
+const MECHANISM_RULES: MechanismRule[] = [
+  { words: ['lend', 'cdp', 'collateral'], mechanism: 'borrowers pay interest on supplied collateral, and the protocol keeps the spread plus liquidation fees', risk: 'Check the health factor of the borrow; if it falls below 2.0, repay part of the borrow or add collateral before it nears liquidation' },
+  { words: ['dex', 'yield', 'leveraged farm'], mechanism: 'swap fees and incentives paid to liquidity providers', risk: 'Check the pool price against your liquidity range; if the price leaves the range, re-centre it or accept the impermanent loss before withdrawing' },
+  { words: ['bridge', 'cross chain'], mechanism: 'relayer and bridging fees on each transfer', risk: 'Check that the destination chain shows the bridged funds and the bridge\u2019s own status page reports no incident before bridging more' },
+  { words: ['staking', 'restak'], mechanism: 'validator rewards shared with stakers', risk: 'Check the unbonding period and whether your validator is still in the active set; restake elsewhere if it drops out' },
+  { words: ['perpetual', 'derivative', 'options', 'synthetic'], mechanism: 'trading fees and funding payments from open positions', risk: 'Check the funding rate and your liquidation price while a position is open; close it if funding runs against you for three days' },
+  { words: ['prediction'], mechanism: 'fees on resolved markets', risk: 'Check the market\u2019s resolution rules before placing a position; a market that resolves on an ambiguous outcome can pay nothing' },
+  { words: ['curator', 'allocator', 'onchain capital'], mechanism: 'performance and management fees on the vault\u2019s strategy', risk: 'Check the vault\u2019s strategy and its curator\u2019s recent changes; withdraw if the strategy changes to one you did not sign up for' },
+  { words: ['stable'], mechanism: 'minting fees and yield on the reserves backing the stable asset', risk: 'Check the peg; if the stable asset trades below $0.99 for more than a day, unwind the position' },
+  { words: ['rwa', 'basis'], mechanism: 'yield on the real-world or basis assets backing the token', risk: 'Check the backing and the redemption queue; if redemptions pause, treat the position as locked and stop adding' },
+  { words: ['insurance'], mechanism: 'premiums paid by protocols buying cover', risk: 'Check the cover\u2019s terms and the claims queue; a claim filed against your pool pays out of staked capital' },
+  { words: ['privacy'], mechanism: 'fees on shielded transfers', risk: 'Check the shielded pool\u2019s anonymity set; a shrinking set weakens the privacy the deposit buys' },
+  { words: ['launchpad'], mechanism: 'allocation fees on token sales', risk: 'Check the sale\u2019s vesting terms before committing; a long cliff turns a quick flip into a months-long hold' },
+  { words: ['nft'], mechanism: 'trading and mint fees', risk: 'Check the floor price and the collection\u2019s volume; an illiquid collection can take weeks to exit' },
+  { words: ['gaming', 'social', 'ai'], mechanism: 'fees on in-app spending', risk: 'Check the app\u2019s reward rules; a rule change can cut the points a session earns' },
+];
+
+/** The category's mechanism: how it earns, and the risk that earning carries. */
+export function mechanismFor(p: SnapshotProtocol): { mechanism: string; risk: string } {
+  const c = (p.category ?? '').toLowerCase();
+  for (const rule of MECHANISM_RULES) {
+    if (rule.words.some((w) => c.includes(w))) return { mechanism: rule.mechanism, risk: rule.risk };
+  }
+  return {
+    mechanism: 'fees on the activity it hosts',
+    risk: 'Check the protocol\u2019s TVL and seven-day growth; if growth turns negative for two straight weeks, unwind half the position',
+  };
+}
+
 /** One weekly rule: when the category names one of `words`, the week looks like `text`. */
 interface WeeklyRule {
   words: string[];
@@ -785,18 +1035,20 @@ function poolShare(capital: number, tvl: number): string {
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost, a time and an expected
+ * A protocol's farm plan: eight steps, each an action with a cost, a time and an expected
  * value computed from the protocol's own figures. Step one is the prerequisite (a fresh
- * wallet); the five value steps that follow are ordered by expected value, highest first,
+ * wallet); the six value steps that follow are ordered by expected value, highest first,
  * so the step a reader should do first is the step worth the most; the farm log closes
  * the plan. The first value step is protocol-specific: it names the protocol, its chain,
- * its capital and the share of its TVL that capital is, so no two rows share the same
- * opening move. Nothing here claims a token, an airdrop date or a points program exists:
- * the claim step says to check the protocol's own page, because the snapshot records no
- * token and a record is not proof there is none. The expected value is the model's own
- * claim under one stated assumption — a 5% community allocation of the implied value,
- * split across about 50,000 farmers — and it is printed next to every step it belongs to,
- * so a reader can see what each action is worth before paying its gas.
+ * its capital, the share of its TVL that capital is, and how the protocol earns — so no
+ * two rows share the same opening move, and the plan follows from the mechanism the
+ * category actually runs. The risk step is the mechanism's own check, with the threshold
+ * that says to stop. Nothing here claims a token, an airdrop date or a points program
+ * exists: the claim step says to check the protocol's own page, because the snapshot
+ * records no token and a record is not proof there is none. The expected value is the
+ * model's own claim under one stated assumption — a 5% community allocation of the
+ * implied value, split across about 50,000 farmers — and it is printed next to every
+ * step it belongs to, so a reader can see what each action is worth before paying its gas.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null, implied: number, model: ModelConstants = MODEL): FarmStep[] {
   const chain = firstChain(p);
@@ -806,8 +1058,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, implied: numb
   const gas = capital >= 150 ? 8 : 4;
   const baseEv = evFor(implied, model);
   const share = poolShare(capital, p.tvl_usd);
+  const { mechanism, risk } = mechanismFor(p);
   const main: FarmStep = {
-    text: `${actionFor(p, capital, chain).replace(/\.$/, '')} — $${capital} is ${share} of its ${shortUsd(p.tvl_usd)} TVL on ${chain}.`,
+    text: `${actionFor(p, capital, chain).replace(/\.$/, '')} — $${capital} is ${share} of its ${shortUsd(p.tvl_usd)} TVL on ${chain}. The protocol earns ${mechanism}.`,
     cost: `$${capital} of capital and about $${gas} of gas`,
     time: '15 minutes to set up',
     ev: baseEv,
@@ -824,6 +1077,12 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, implied: numb
     time: `${hold} days`,
     ev: baseEv * 0.25,
   };
+  const riskStep: FarmStep = {
+    text: `${risk}. Do this check once a week while the position is open, and act on it the same day it trips.`,
+    cost: 'nothing but the check',
+    time: '10 minutes a week',
+    ev: baseEv * 0.15,
+  };
   const claim: FarmStep = {
     text: `Before you withdraw, open the protocol's own points or rewards page from its docs and claim only from a link it publishes.`,
     cost: 'no fee to check, and never pay to claim',
@@ -838,7 +1097,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, implied: numb
   };
   // The value steps, ordered by expected value, highest first: the reader's first move is
   // the move worth the most, and every step below it is worth less than the one above it.
-  const valueSteps = [main, weekly, holdStep, claim, monitor].sort((a, b) => b.ev - a.ev);
+  const valueSteps = [main, weekly, holdStep, riskStep, claim, monitor].sort((a, b) => b.ev - a.ev);
   return [
     {
       text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.',
@@ -893,30 +1152,19 @@ export function thesisFor(row: BoardRow): string {
 
 /* ------------------------------------------------------- board assembly -- */
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
+/**
+ * The protocols the board ranks, strongest first, with ranks 1..n: every protocol the
+ * watchlist rule keeps, at any TVL. The watchlist is inside it by construction, and the
+ * board is the whole pre-token set the rule defines — nothing below the floor is left
+ * out for being small, and nothing above it is left out for being large.
+ */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const multiples = categoryMultiples(snapshot, model);
+  const pricers = buildPricers(snapshot, null, model);
   const stats = sectorStats(snapshot, model);
   const global = globalLogStats(snapshot);
-  const index = indexBySlug(snapshot.protocols);
-  const chosen = new Map<string, SnapshotProtocol>();
-  // The watchlist is the floor: every slug it names is chosen, even one the snapshot no
-  // longer carries (it cannot, but coverage is the gate's row and is never gambled on a
-  // missing record).
-  for (const slug of snapshot.watchlist) {
-    const p = index.get(slug);
-    if (p !== undefined) chosen.set(slug, p);
-  }
-  // The early radar: pre-token protocols below the watchlist floor, by TVL, capped. A
-  // chosen protocol stays chosen; the early rows only ever add to the board.
-  const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .sort(byTvl)
-    .slice(0, EARLY_ROWS);
-  for (const p of early) chosen.set(p.slug, p);
-
-  const scored = [...chosen.values()].map((p) => {
-    const score = impliedValue(p, snapshot.as_of, multiples, stats, global.mean, global.sd, model);
+  const chosen = snapshot.protocols.filter((p) => isBoardRow(p));
+  const scored = chosen.map((p) => {
+    const score = impliedValue(p, snapshot.as_of, pricers, stats, global.mean, global.sd, model);
     return { p, score };
   });
   scored.sort((a, b) => byValue(
@@ -943,6 +1191,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       model: {
         multiple: score.multiple,
         comps_n: score.comps,
+        pricer_kind: score.pricerKind,
+        fit_slope: score.fitSlope,
+        fit_r2: score.fitR2,
         growth_pct: score.growthPct,
         growth_multiplier: score.growthMult,
         maturity_multiplier: score.maturityMult,
@@ -991,6 +1242,9 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     multiple: row.model.multiple,
     comps_n: row.model.comps_n,
+    pricer_kind: row.model.pricer_kind,
+    fit_slope: row.model.fit_slope,
+    fit_r2: row.model.fit_r2,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     reach_multiplier: row.model.reach_multiplier,
@@ -1003,16 +1257,57 @@ export function radarRow(row: BoardRow): RadarRow {
   };
 }
 
+/**
+ * The stress lab: the board is rebuilt under five changes of assumption — the
+ * comparables 20% cheaper and 20% dearer, a weaker and a stronger growth weight, and
+ * the maturity factor switched off — and each rebuild is measured against the base
+ * board: how many of the base top ten survive in the new top ten, the largest rank move
+ * among them, and who leads under the new assumption. A top ten that survives every
+ * shock is a ranking the reader can lean on; one that does not says so on the page.
+ */
+export function stressLab(snapshot: Snapshot, model: ModelConstants = MODEL): StressScenario[] {
+  const base = buildBoard(snapshot, model);
+  const baseTop10 = base.slice(0, 10);
+  const variants: Array<[string, ModelConstants]> = [
+    ['comparables −20%', { ...model, multiple_scale: 0.8 }],
+    ['comparables +20%', { ...model, multiple_scale: 1.2 }],
+    ['growth weight 0.25', { ...model, growth_weight: 0.25 }],
+    ['growth weight 0.75', { ...model, growth_weight: 0.75 }],
+    ['no maturity factor', { ...model, maturity_off: true }],
+  ];
+  return variants.map(([name, variant]) => {
+    const board = buildBoard(snapshot, variant);
+    const rankOf = new Map(board.map((r) => [r.slug, r.rank]));
+    const top10 = new Set(board.slice(0, 10).map((r) => r.slug));
+    let overlap = 0;
+    let maxMove = 0;
+    for (const r of baseTop10) {
+      if (top10.has(r.slug)) overlap++;
+      const vr = rankOf.get(r.slug);
+      if (vr !== undefined) maxMove = Math.max(maxMove, Math.abs(vr - r.rank));
+    }
+    return { name, top10_overlap: overlap, max_rank_move: maxMove, top1_name: board[0]?.name ?? '' };
+  });
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
-  const multiples = categoryMultiples(snapshot, model);
+  const pricers = buildPricers(snapshot, null, model);
   const watchlist = new Set(snapshot.watchlist);
   const early = board.filter((r) => !watchlist.has(r.slug)).length;
-  const comps: CategoryComp[] = [...multiples.byCategory.entries()]
-    .map(([category, v]) => ({ category, comps: v.comps, multiple: round4(v.multiple) }))
-    .sort((a, b) => b.multiple - a.multiple || a.category.localeCompare(b.category));
+  const comps: CategoryComp[] = [...pricers.byCategory.entries()]
+    .map(([category, v]) => {
+      // The multiple the table prints is the fitted multiple at $100M of TVL, so a
+      // fitted category and a median category can be read on the same scale.
+      let multiple = v.medianMultiple;
+      if ((v.kind === 'fit' || v.kind === 'global-fit') && v.slope !== null && v.intercept !== null) {
+        multiple = bandMultiple(Math.pow(10, v.intercept + v.slope * 8) / 100_000_000, model);
+      }
+      return { category, comps: v.n, kind: v.kind, slope: v.slope, r2: v.r2, multiple: round4(multiple) };
+    })
+    .sort((a, b) => b.comps - a.comps || a.category.localeCompare(b.category));
   const conviction: ConvictionEntry[] = board.slice(0, 10).map((r) => ({
     rank: r.rank,
     slug: r.slug,
@@ -1029,9 +1324,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    global_multiple: round4(multiples.global.multiple),
-    global_comps: multiples.global.comps,
+    global_multiple: round4(pricers.global.medianMultiple),
+    global_comps: pricers.global.n,
     comps,
+    backtest: backtestPricing(snapshot, model),
+    stress: stressLab(snapshot, model),
     rows: board.map(radarRow),
     live,
     conviction,

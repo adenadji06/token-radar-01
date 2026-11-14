@@ -2,9 +2,10 @@
 //
 // Reads window.RADAR (written beside dashboard/ by main.ts) and renders the ranked board,
 // a filterable table, a per-protocol detail drawer with the model's own inputs and the
-// protocol's farm plan, the top-ten conviction section, and the comparable-multiples table
-// the model runs on. No network: every byte it shows is already in data.js. The page never
-// prints the snapshot's source string, only its date, so no address ever appears in the page.
+// protocol's farm plan, the top-ten conviction section, the size-fitted comparables
+// table the model runs on, and the backtest and stress lab it is checked with. No
+// network: every byte it shows is already in data.js. The page never prints the
+// snapshot's source string, only its date, so no address ever appears in the page.
 //
 // The page recomputes every row's implied value from the snapshot figures with the same
 // arithmetic main.ts runs, and the detail view says whether the two numbers agree — the
@@ -142,7 +143,7 @@
   // The farm plan is the same derivation main.ts writes to board.json: category, chains,
   // TVL, age and implied value decide the action, the capital, the hold, every cost, every
   // time and every expected value. No name is special-cased, and the page's plan and the
-  // board's plan are the same strings. The five value steps are ordered by expected value,
+  // board's plan are the same strings. The six value steps are ordered by expected value,
   // highest first, with the fresh-wallet prerequisite before them and the farm log after.
   function chainOf(p) {
     return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain';
@@ -222,6 +223,34 @@
     return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
   }
 
+  /** Mechanism rules, first match wins, same order and words as the action rules: how the
+      category earns, and the one risk check that mechanism demands every week. */
+  var MECHANISM_RULES = [
+    { words: ['lend', 'cdp', 'collateral'], m: 'borrowers pay interest on supplied collateral, and the protocol keeps the spread plus liquidation fees', r: 'Check the health factor of the borrow; if it falls below 2.0, repay part of the borrow or add collateral before it nears liquidation' },
+    { words: ['dex', 'yield', 'leveraged farm'], m: 'swap fees and incentives paid to liquidity providers', r: 'Check the pool price against your liquidity range; if the price leaves the range, re-centre it or accept the impermanent loss before withdrawing' },
+    { words: ['bridge', 'cross chain'], m: 'relayer and bridging fees on each transfer', r: 'Check that the destination chain shows the bridged funds and the bridge\u2019s own status page reports no incident before bridging more' },
+    { words: ['staking', 'restak'], m: 'validator rewards shared with stakers', r: 'Check the unbonding period and whether your validator is still in the active set; restake elsewhere if it drops out' },
+    { words: ['perpetual', 'derivative', 'options', 'synthetic'], m: 'trading fees and funding payments from open positions', r: 'Check the funding rate and your liquidation price while a position is open; close it if funding runs against you for three days' },
+    { words: ['prediction'], m: 'fees on resolved markets', r: 'Check the market\u2019s resolution rules before placing a position; a market that resolves on an ambiguous outcome can pay nothing' },
+    { words: ['curator', 'allocator', 'onchain capital'], m: 'performance and management fees on the vault\u2019s strategy', r: 'Check the vault\u2019s strategy and its curator\u2019s recent changes; withdraw if the strategy changes to one you did not sign up for' },
+    { words: ['stable'], m: 'minting fees and yield on the reserves backing the stable asset', r: 'Check the peg; if the stable asset trades below $0.99 for more than a day, unwind the position' },
+    { words: ['rwa', 'basis'], m: 'yield on the real-world or basis assets backing the token', r: 'Check the backing and the redemption queue; if redemptions pause, treat the position as locked and stop adding' },
+    { words: ['insurance'], m: 'premiums paid by protocols buying cover', r: 'Check the cover\u2019s terms and the claims queue; a claim filed against your pool pays out of staked capital' },
+    { words: ['privacy'], m: 'fees on shielded transfers', r: 'Check the shielded pool\u2019s anonymity set; a shrinking set weakens the privacy the deposit buys' },
+    { words: ['launchpad'], m: 'allocation fees on token sales', r: 'Check the sale\u2019s vesting terms before committing; a long cliff turns a quick flip into a months-long hold' },
+    { words: ['nft'], m: 'trading and mint fees', r: 'Check the floor price and the collection\u2019s volume; an illiquid collection can take weeks to exit' },
+    { words: ['gaming', 'social', 'ai'], m: 'fees on in-app spending', r: 'Check the app\u2019s reward rules; a rule change can cut the points a session earns' },
+  ];
+
+  function mechanismFor(p) {
+    var c = (p.category || '').toLowerCase();
+    for (var i = 0; i < MECHANISM_RULES.length; i++) {
+      var rule = MECHANISM_RULES[i];
+      if (rule.words.some(function (w) { return c.indexOf(w) >= 0; })) return { mechanism: rule.m, risk: rule.r };
+    }
+    return { mechanism: 'fees on the activity it hosts', risk: 'Check the protocol\u2019s TVL and seven-day growth; if growth turns negative for two straight weeks, unwind half the position' };
+  }
+
   /** One step as a single string: its action, then its cost, time and expected value. */
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
@@ -231,7 +260,7 @@
     return s;
   }
 
-  /** A protocol's seven-step farm plan, each step an action with a cost, a time and an EV. */
+  /** A protocol's eight-step farm plan, each step an action with a cost, a time and an EV. */
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
@@ -240,8 +269,9 @@
     var gas = capital >= 150 ? 8 : 4;
     var baseEv = evFor(p.implied_value_usd);
     var share = poolShare(capital, p.tvl_usd);
+    var mech = mechanismFor(p);
     var main = {
-      text: actionFor(p, capital, chain).replace(/\.$/, '') + ' — $' + capital + ' is ' + share + ' of its ' + fmtUsd(p.tvl_usd) + ' TVL on ' + chain + '.',
+      text: actionFor(p, capital, chain).replace(/\.$/, '') + ' — $' + capital + ' is ' + share + ' of its ' + fmtUsd(p.tvl_usd) + ' TVL on ' + chain + '. The protocol earns ' + mech.mechanism + '.',
       cost: '$' + capital + ' of capital and about $' + gas + ' of gas',
       time: '15 minutes to set up',
       ev: baseEv,
@@ -258,6 +288,12 @@
       time: hold + ' days',
       ev: baseEv * 0.25,
     };
+    var riskStep = {
+      text: mech.risk + '. Do this check once a week while the position is open, and act on it the same day it trips.',
+      cost: 'nothing but the check',
+      time: '10 minutes a week',
+      ev: baseEv * 0.15,
+    };
     var claim = {
       text: "Before you withdraw, open the protocol's own points or rewards page from its docs and claim only from a link it publishes.",
       cost: 'no fee to check, and never pay to claim',
@@ -270,7 +306,7 @@
       time: '5 minutes a week',
       ev: baseEv * 0.05,
     };
-    var valueSteps = [main, weekly, holdStep, claim, monitor].sort(function (a, b) { return b.ev - a.ev; });
+    var valueSteps = [main, weekly, holdStep, riskStep, claim, monitor].sort(function (a, b) { return b.ev - a.ev; });
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes', ev: 0 },
     ].concat(valueSteps).concat([
@@ -286,7 +322,7 @@
     if (!hash) return;
     var params = new URLSearchParams(hash);
     if (params.get('q')) state.q = params.get('q');
-    if (params.get('p')) state.selected = params.get('p');
+    state.selected = params.get('p');
     if (params.get('category')) state.category = params.get('category');
     if (params.get('chain')) state.chain = params.get('chain');
     if (params.get('mintvl')) state.mintvl = Number(params.get('mintvl')) || 0;
@@ -376,17 +412,18 @@
       h('div', null,
         h('h1', { html: DATA.watchlist_size + ' watchlist protocols, ranked by <span class="hl">implied value</span>' }),
         h('p', null,
-          'The watchlist is the floor: every protocol with at least ', h('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }),
-          ' of TVL and no token on record. The early radar adds ', h('b', { text: String(DATA.early_size) }),
-          ' pre-token protocols below that floor. Implied value is a model built from the market itself — the median market-cap / TVL of live tokens in the same category — then adjusted by sector-relative signals: how large the protocol is for its own sector, how fast it grows against its sector, and any catalyst it carries. It is not a promise and not a price.'
+          'The board is every protocol the watchlist rule keeps, at any size: the ', h('b', { text: String(DATA.watchlist_size) }),
+          ' on the watchlist plus ', h('b', { text: String(DATA.early_size) }),
+          ' more that record no token and are not a wrapped, staked or bridged product of one that trades. Implied value is a size-fitted comparables price — a log-log fit of live-token market caps on TVL in the same category, so a large protocol is priced at the multiple large live protocols actually carry — then adjusted by sector-relative signals: how large the protocol is for its own sector, how fast it grows against its sector, and any catalyst it carries. It is not a promise and not a price.'
         )
       ),
       h('div', { class: 'facts' },
         h('div', { class: 'fact' }, h('span', { text: 'Watchlist covered' }), h('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         h('div', { class: 'fact' }, h('span', { text: 'Pre-token rows scored' }), h('b', { text: String(DATA.board_size) })),
-        h('div', { class: 'fact' }, h('span', { text: 'Early rows below the floor' }), h('b', { text: String(DATA.early_size) })),
+        h('div', { class: 'fact' }, h('span', { text: 'Rows outside the watchlist' }), h('b', { text: String(DATA.early_size) })),
+        h('div', { class: 'fact' }, h('span', { text: 'Backtest median error' }), h('b', { text: DATA.backtest.median_abs_pct_error + '% over ' + DATA.backtest.n + ' live tokens' })),
         h('div', { class: 'fact' }, h('span', { text: 'Live-token protocols set aside' }), h('b', { text: String(DATA.live_size) })),
-        h('div', { class: 'fact' }, h('span', { text: 'Global comparable multiple' }), h('b', { text: fmtMult(DATA.global_multiple) + ' (' + DATA.global_comps + ' live tokens)' }))
+        h('div', { class: 'fact' }, h('span', { text: 'Global median multiple' }), h('b', { text: fmtMult(DATA.global_multiple) + ' (' + DATA.global_comps + ' live tokens)' }))
       )
     );
   }
@@ -591,34 +628,67 @@
     );
   }
 
+  function pricerLabel(kind) {
+    if (kind === 'fit') return 'size fit';
+    if (kind === 'global-fit') return 'global fit';
+    return 'median';
+  }
+
   function modelPanel() {
     var m = DATA.model;
     var compsRows = DATA.comps.slice(0, 12).map(function (c) {
       return h('tr', null,
         h('td', { text: c.category }),
         h('td', { class: 'num', text: String(c.comps) }),
+        h('td', { text: pricerLabel(c.kind) }),
+        h('td', { class: 'num', text: c.slope === null || c.slope === undefined ? '—' : c.slope.toFixed(2) }),
+        h('td', { class: 'num', text: c.r2 === null || c.r2 === undefined ? '—' : c.r2.toFixed(2) }),
         h('td', { class: 'num', text: fmtMult(c.multiple) })
       );
     });
-    var formula = 'implied = round( tvl_usd x comp_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') x signal )';
+    var formula = 'base = size-fitted comparables price: log10(mcap) = a + b x log10(tvl), fitted on the live-token protocols of the row’s own category (5+ comps); the category median mcap / TVL where comps are thin (3-4); the global fit where thinner still. implied = round( base x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') x signal )';
     var signalFormula = 'signal = clamp( 1 + ' + m.signal_tvl + ' x tanh(tvl_z) + ' + m.signal_growth + ' x tanh(growth_z) + ' + m.catalyst_boost + ' when a catalyst is present, ' + m.signal_floor + ', ' + m.signal_cap + ' )';
+    var bt = DATA.backtest;
+    var stressRows = DATA.stress.map(function (s) {
+      return h('tr', null,
+        h('td', { text: s.name }),
+        h('td', { class: 'num', text: s.top10_overlap + ' / 10' }),
+        h('td', { class: 'num', text: String(s.max_rank_move) }),
+        h('td', { text: s.top1_name })
+      );
+    });
     return h('section', { class: 'panel model' },
       h('h2', { text: 'How implied value is computed' }),
-      h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The multiple is not a guess: it is the median market-cap / TVL of the live-token protocols in the same category, computed from this snapshot at run time. Categories with fewer than ' + m.min_comps + ' live comparables use the global median of ' + fmtMult(DATA.global_multiple) + ' across ' + DATA.global_comps + ' live tokens. No protocol name is special-cased, and no row is hand-picked.' }),
+      h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The price is not a guess and not a flat median: a plain median multiple prices a $5M protocol and a $2B protocol at the same ratio, and the market does not — larger protocols trade at a different multiple of TVL than small ones — so each category is fitted with a log-log line of market cap on TVL, and the multiple is read off that line at the row’s own size. Categories with fewer than ' + m.min_fit_comps + ' live comparables use their median multiple, and the thinnest use the global fit across ' + DATA.global_comps + ' live tokens. No protocol name is special-cased, and no row is hand-picked.' }),
       h('div', { class: 'formula' }, formula),
       h('div', { class: 'formula' }, signalFormula),
       h('p', { class: 'sub', text: 'The signal factor is what separates this board from a comps table. tvl_z is the z-score of log TVL among the pre-token protocols of the row’s own category; growth_z is the z-score of its winsorised seven-day growth against its category’s median and MAD, so one 4,000% week cannot move a sector; momentum is the winsorised growth minus the category median, in points; the sector z-score compares the category’s own multiple with the global live-token distribution. A catalyst — a seven-day surge of ' + m.catalyst_surge_pct + '% or more, a protocol under ' + m.catalyst_young_days + ' days old already at ' + fmtUsd(m.catalyst_young_tvl) + ' of TVL, or a presence on ' + m.catalyst_chains + ' or more chains — adds ' + m.catalyst_boost + ' to the factor.' }),
-      h('p', { class: 'sub', text: 'Each farm step states its expected value under one stated assumption: a 5% community allocation of the implied value, split across about 50,000 farmers. The value steps are ordered by that expected value, highest first, so the first move is the move worth the most.' }),
-      h('h3', { text: 'Comparable multiples by category' }),
+      h('p', { class: 'sub', text: 'Each farm step states its expected value under one stated assumption: a 5% community allocation of the implied value, split across about 50,000 farmers. The value steps are ordered by that expected value, highest first, so the first move is the move worth the most. Each plan is mechanism-aware: the opening step names how the protocol earns, and the risk step is the one check that mechanism demands every week, with the threshold that says to stop.' }),
+      h('h3', { text: 'Comparable prices by category — multiple at $100M of TVL' }),
       h('table', { class: 'comps' },
         h('thead', null, h('tr', null,
           h('th', { scope: 'col', text: 'Category' }),
           h('th', { scope: 'col', class: 'num', text: 'Live comps' }),
-          h('th', { scope: 'col', class: 'num', text: 'Median mcap / TVL' })
+          h('th', { scope: 'col', text: 'Method' }),
+          h('th', { scope: 'col', class: 'num', text: 'Slope' }),
+          h('th', { scope: 'col', class: 'num', text: 'R²' }),
+          h('th', { scope: 'col', class: 'num', text: 'Multiple @ $100M' })
         )),
         h('tbody', null, compsRows)
       ),
-      h('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
+      h('h3', { text: 'Backtest — pricing the live market with itself' }),
+      h('p', { class: 'sub', text: 'Leave-one-out over ' + bt.n + ' live-token protocols: each one is priced by the method trained on the other ' + (bt.n - 1) + ', and the prediction is scored against the market cap the market actually gave it. Median absolute error ' + bt.median_abs_pct_error + '%, ' + bt.within_2x_pct + '% of predictions within 2x of the real market cap and ' + bt.within_50_pct + '% within 50%. The plain median-multiple method, on the same leave-one-out training sets, misses by ' + bt.baseline_median_abs_pct_error + '% at the median (' + bt.baseline_within_2x_pct + '% within 2x) — the size fit earns its keep.' }),
+      h('h3', { text: 'Stress lab — what survives a change of assumption' }),
+      h('table', { class: 'comps' },
+        h('thead', null, h('tr', null,
+          h('th', { scope: 'col', text: 'Scenario' }),
+          h('th', { scope: 'col', class: 'num', text: 'Top-10 overlap' }),
+          h('th', { scope: 'col', class: 'num', text: 'Max rank move' }),
+          h('th', { scope: 'col', text: 'Leads under the scenario' })
+        )),
+        h('tbody', null, stressRows)
+      ),
+      h('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The board is every protocol the watchlist rule keeps, at any size — the watchlist plus the rest the rule keeps below the floor and above it — and the live-token protocols are set aside with their market caps shown.' })
     );
   }
 
@@ -665,6 +735,9 @@
       h('div', { class: 'equation' },
         equationRow('TVL', fmtUsd(row.tvl_usd)),
         equationRow('Comparable multiple (' + (row.category || 'Other') + ', ' + row.comps_n + ' live comps)', fmtMult(row.multiple)),
+        equationRow('Comparable pricing', pricerLabel(row.pricer_kind) + (row.pricer_kind === 'fit' || row.pricer_kind === 'global-fit' ? ' — multiple read off the log-log fit at this TVL' : ' — category median mcap / TVL')),
+        row.fit_slope === null || row.fit_slope === undefined ? null : equationRow('Fit slope (log mcap on log TVL)', row.fit_slope.toFixed(2)),
+        row.fit_r2 === null || row.fit_r2 === undefined ? null : equationRow('Fit R² (share of the category the fit explains)', row.fit_r2.toFixed(2)),
         equationRow('Seven-day growth', fmtPct(row.change_7d)),
         equationRow('Age with no token', fmtAge(row.age_days)),
         equationRow('Growth multiplier', row.growth_multiplier.toFixed(4)),
@@ -726,10 +799,12 @@
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
     if (state.selected) openDetail(state.selected);
+    else if (dialog.open) dialog.close();
   }
 
   readHash();
   render();
+  window.addEventListener('hashchange', function () { readHash(); render(); });
   window.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && dialog.open) dialog.close();
   });
