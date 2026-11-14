@@ -2,13 +2,17 @@
 //
 // Reads window.RADAR (written beside dashboard/ by main.ts) and renders the ranked board,
 // a filterable table, a per-protocol detail drawer with the model's own inputs and the
-// protocol's farm plan, and the comparable-multiples table the model runs on. No network:
-// every byte it shows is already in data.js. The page never prints the snapshot's source
-// string, only its date, so no address ever appears in the page.
+// protocol's farm plan, the top-ten conviction section, and the comparable-multiples table
+// the model runs on. No network: every byte it shows is already in data.js. The page never
+// prints the snapshot's source string, only its date, so no address ever appears in the page.
 //
 // The page recomputes every row's implied value from the snapshot figures with the same
 // arithmetic main.ts runs, and the detail view says whether the two numbers agree — the
-// board's data and the page's code are visibly the same model.
+// board's data and the page's code are visibly the same model. The farm plan the page
+// shows is the same derivation main.ts writes to board.json: category, chains, TVL, age,
+// implied value and the signal factor decide the action, the capital, the hold, every cost,
+// every time and every expected value. No name is special-cased, and the page's plan and
+// the board's plan are the same strings.
 (function () {
   'use strict';
 
@@ -59,9 +63,32 @@
     return (Math.round(n * 100) / 100).toFixed(2) + 'x';
   }
 
+  /** A z-score with its sign and sigma, or 'n/a' when it is not a number. */
+  function fmtZ(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n >= 0 ? '+' : '') + n.toFixed(2) + 'σ';
+  }
+
+  /** An expected value as the farm plan prints it. */
+  function fmtEv(ev) {
+    if (ev >= 100) return '~$' + Math.round(ev);
+    if (ev >= 10) return '~$' + ev.toFixed(0);
+    return '~$' + ev.toFixed(2);
+  }
+
+  /** The short words for a catalyst flag. */
+  function catalystShort(catalyst, row) {
+    if (catalyst === 'surge') return 'surge';
+    if (catalyst === 'young-giant') return 'young + large';
+    if (catalyst === 'multi-chain') return (row.chains || []).length + ' chains';
+    return '';
+  }
+
   /**
    * A row's implied value, recomputed here from the snapshot figures with the model's own
-   * arithmetic. The multiple is the row's category comparable, already carried in the data.
+   * arithmetic, including the signal factor the row carries. The multiple is the row's
+   * category comparable, already carried in the data; the signal multiplier is the
+   * sector-relative factor main.ts computed from the same snapshot.
    */
   function impliedOf(row, model) {
     var change = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
@@ -72,7 +99,8 @@
     var maturity = model.maturity_floor + (cappedAge / model.maturity_days) * model.maturity_range;
     var chains = (row.chains || []).length;
     var reach = 1 + Math.min(Math.max(chains - 1, 0), model.reach_max_chains) * model.reach_step;
-    return Math.max(1, Math.round(row.tvl_usd * row.multiple * growthMult * maturity * reach));
+    var signal = row.signal_multiplier === null || row.signal_multiplier === undefined ? 1 : row.signal_multiplier;
+    return Math.max(1, Math.round(row.tvl_usd * row.multiple * growthMult * maturity * reach * signal));
   }
 
   /* ------------------------------------------------------ element builder -- */
@@ -112,8 +140,10 @@
   /* ------------------------------------------------------- farm plan, page -- */
 
   // The farm plan is the same derivation main.ts writes to board.json: category, chains,
-  // TVL and age decide the action, the capital, the hold and every cost and time. No name
-  // is special-cased, and the page's plan and the board's plan are the same strings.
+  // TVL, age and implied value decide the action, the capital, the hold, every cost, every
+  // time and every expected value. No name is special-cased, and the page's plan and the
+  // board's plan are the same strings. The five value steps are ordered by expected value,
+  // highest first, with the fresh-wallet prerequisite before them and the farm log after.
   function chainOf(p) {
     return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain';
   }
@@ -130,6 +160,20 @@
     if (age < 180) return 60;
     if (age < 365) return 45;
     return 30;
+  }
+
+  /** The expected value of one farm position, under the stated 5% / 50,000-farmer assumption. */
+  function evFor(implied) {
+    return (implied * DATA.model.ev_allocation) / DATA.model.ev_farmers;
+  }
+
+  /** A protocol's share of its own TVL from one position, as the plan prints it. */
+  function poolShare(capital, tvl) {
+    var pct = (capital / Math.max(1, tvl)) * 100;
+    if (pct >= 0.01) return pct.toFixed(2) + '%';
+    if (pct >= 0.0001) return pct.toFixed(4) + '%';
+    if (pct >= 0.0000001) return pct.toFixed(7).replace(/0+$/, '') + '%';
+    return '<0.0000001%';
   }
 
   /** Action rules, first match wins: words matched as substrings of the lowercased category. */
@@ -178,28 +222,60 @@
     return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
   }
 
-  /** One step as a single string: its action, then its cost and time. */
+  /** One step as a single string: its action, then its cost, time and expected value. */
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
+    if (step.ev > 0) s += ' Expected value: ' + fmtEv(step.ev) + ' at a 5% community allocation split across ~50,000 farmers.';
     if (s.length > 600) s = s.slice(0, 596) + '...';
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
 
-  /** A protocol's six-step farm plan, each step an action with a cost and a time. */
+  /** A protocol's seven-step farm plan, each step an action with a cost, a time and an EV. */
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var weeks = Math.max(1, Math.ceil(hold / 7));
     var gas = capital >= 150 ? 8 : 4;
+    var baseEv = evFor(p.implied_value_usd);
+    var share = poolShare(capital, p.tvl_usd);
+    var main = {
+      text: actionFor(p, capital, chain).replace(/\.$/, '') + ' — $' + capital + ' is ' + share + ' of its ' + fmtUsd(p.tvl_usd) + ' TVL on ' + chain + '.',
+      cost: '$' + capital + ' of capital and about $' + gas + ' of gas',
+      time: '15 minutes to set up',
+      ev: baseEv,
+    };
+    var weekly = {
+      text: weeklyFor(p) + ' Repeat it for ' + weeks + ' weeks while the position is open.',
+      cost: 'about $2 of gas a week, about $' + (2 * weeks) + ' over ' + weeks + ' weeks',
+      time: '10 minutes a week',
+      ev: baseEv * 0.35,
+    };
+    var holdStep = {
+      text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early: an early exit forfeits the weeks already farmed.',
+      cost: 'the $' + capital + ' stays in the position',
+      time: hold + ' days',
+      ev: baseEv * 0.25,
+    };
+    var claim = {
+      text: "Before you withdraw, open the protocol's own points or rewards page from its docs and claim only from a link it publishes.",
+      cost: 'no fee to check, and never pay to claim',
+      time: '10 minutes',
+      ev: baseEv * 0.1,
+    };
+    var monitor = {
+      text: "Check " + p.name + "'s TVL and seven-day growth once a week; if growth turns negative for two straight weeks, unwind half the position and move that capital to the next row on the board.",
+      cost: 'nothing but the check',
+      time: '5 minutes a week',
+      ev: baseEv * 0.05,
+    };
+    var valueSteps = [main, weekly, holdStep, claim, monitor].sort(function (a, b) { return b.ev - a.ev; });
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + gas + ' of gas', time: '15 minutes to set up' },
-      { text: weeklyFor(p), cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page from its docs and claim only from a link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' },
-    ].map(stepText);
+      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes', ev: 0 },
+    ].concat(valueSteps).concat([
+      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes', ev: 0 },
+    ]).map(stepText);
   }
 
   /* ------------------------------------------------------------ URL state -- */
@@ -257,6 +333,7 @@
     if (state.sort === 'growth') return r.change_7d === null ? -Infinity : r.change_7d;
     if (state.sort === 'age') return r.age_days === null ? Infinity : r.age_days;
     if (state.sort === 'multiple') return r.multiple;
+    if (state.sort === 'signal') return r.signal_multiplier;
     return r.implied_value_usd;
   }
 
@@ -301,7 +378,7 @@
         h('p', null,
           'The watchlist is the floor: every protocol with at least ', h('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M' }),
           ' of TVL and no token on record. The early radar adds ', h('b', { text: String(DATA.early_size) }),
-          ' pre-token protocols below that floor. Implied value is a model built from the market itself — the median market-cap / TVL of live tokens in the same category — not a promise and not a price.'
+          ' pre-token protocols below that floor. Implied value is a model built from the market itself — the median market-cap / TVL of live tokens in the same category — then adjusted by sector-relative signals: how large the protocol is for its own sector, how fast it grows against its sector, and any catalyst it carries. It is not a promise and not a price.'
         )
       ),
       h('div', { class: 'facts' },
@@ -321,9 +398,25 @@
         h('span', { class: 'rank', text: 'RANK #' + r.rank + ' · ' + (r.category || 'Other').toUpperCase() }),
         h('span', { class: 'name', text: r.name }),
         h('span', { class: 'val', text: fmtUsd(r.implied_value_usd) }),
-        h('span', { class: 'sub', text: 'TVL ' + fmtUsd(r.tvl_usd) + ' · ' + fmtMult(r.multiple) + ' comparable · ' + (r.chains || []).slice(0, 2).join(', ') })
+        h('span', { class: 'sub', text: 'TVL ' + fmtUsd(r.tvl_usd) + ' · ' + fmtMult(r.multiple) + ' comparable · signal ' + fmtMult(r.signal_multiplier) + (r.catalyst ? ' · ' + catalystShort(r.catalyst, r) : '') })
       );
     }));
+  }
+
+  /** The top-ten conviction section: one thesis line per protocol, each opening its detail. */
+  function conviction() {
+    var items = (DATA.conviction || []).map(function (c) {
+      return h('li', null,
+        h('button', { type: 'button', class: 'thesis', onclick: function () { openDetail(c.slug); } },
+          h('span', { class: 'thesis-text', text: c.thesis })
+        )
+      );
+    });
+    return h('section', { class: 'panel conviction' },
+      h('h2', { text: 'Top 10 conviction — why these ten, in one line each' }),
+      h('p', { class: 'sub', text: 'Each thesis is written from the same snapshot figures the board ranks on: the protocol’s TVL and category, its size and growth against its own sector, how long it has run with no token on record, and its catalyst when it carries one. Select a line to open that protocol’s model and farm plan.' }),
+      h('ol', { class: 'thesis-list' }, items)
+    );
   }
 
   /** One filter control: a labelled search box, select or tab group. */
@@ -394,11 +487,15 @@
     return 'an unnamed chain';
   }
 
-  /** One board row: rank, protocol, TVL, growth, age, multiple, implied value, token status. */
+  /** One board row: rank, protocol, TVL, growth, age, multiple, signal, implied value, token status. */
   function boardRow(r, maxImplied) {
     var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
     var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
     var barWidth = Math.max(3, Math.round((r.implied_value_usd / maxImplied) * 100));
+    var signalCell = h('td', { class: 'num signal' },
+      h('span', { text: fmtMult(r.signal_multiplier) }),
+      r.catalyst ? h('span', { class: 'catalyst', text: catalystShort(r.catalyst, r) }) : null
+    );
     var tr = h('tr', {
       'data-selected': state.selected === r.slug ? 'true' : 'false',
       tabindex: '0',
@@ -414,6 +511,7 @@
       h('td', { class: 'num ' + growthClass, text: growth }),
       h('td', { class: 'num', text: fmtAge(r.age_days) }),
       h('td', { class: 'num mult', text: fmtMult(r.multiple) }),
+      signalCell,
       h('td', null, h('div', { class: 'implied' },
         h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: 'width:' + barWidth + '%' })),
         h('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
@@ -438,7 +536,7 @@
     return h('div', { class: 'panel' },
       h('div', { class: 'table-wrap' },
         h('table', null,
-          h('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.' }),
+          h('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model, its signals and its farm plan.' }),
           h('thead', null, h('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
@@ -446,6 +544,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('multiple', 'Comp x'),
+            sortHeader('signal', 'Signal'),
             sortHeader('implied', 'Implied value'),
             h('th', { scope: 'col', text: 'Token' })
           )),
@@ -501,11 +600,15 @@
         h('td', { class: 'num', text: fmtMult(c.multiple) })
       );
     });
-    var formula = 'implied = round( tvl_usd x comp_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') )';
+    var formula = 'implied = round( tvl_usd x comp_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') x signal )';
+    var signalFormula = 'signal = clamp( 1 + ' + m.signal_tvl + ' x tanh(tvl_z) + ' + m.signal_growth + ' x tanh(growth_z) + ' + m.catalyst_boost + ' when a catalyst is present, ' + m.signal_floor + ', ' + m.signal_cap + ' )';
     return h('section', { class: 'panel model' },
       h('h2', { text: 'How implied value is computed' }),
       h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The multiple is not a guess: it is the median market-cap / TVL of the live-token protocols in the same category, computed from this snapshot at run time. Categories with fewer than ' + m.min_comps + ' live comparables use the global median of ' + fmtMult(DATA.global_multiple) + ' across ' + DATA.global_comps + ' live tokens. No protocol name is special-cased, and no row is hand-picked.' }),
       h('div', { class: 'formula' }, formula),
+      h('div', { class: 'formula' }, signalFormula),
+      h('p', { class: 'sub', text: 'The signal factor is what separates this board from a comps table. tvl_z is the z-score of log TVL among the pre-token protocols of the row’s own category; growth_z is the z-score of its winsorised seven-day growth against its category’s median and MAD, so one 4,000% week cannot move a sector; momentum is the winsorised growth minus the category median, in points; the sector z-score compares the category’s own multiple with the global live-token distribution. A catalyst — a seven-day surge of ' + m.catalyst_surge_pct + '% or more, a protocol under ' + m.catalyst_young_days + ' days old already at ' + fmtUsd(m.catalyst_young_tvl) + ' of TVL, or a presence on ' + m.catalyst_chains + ' or more chains — adds ' + m.catalyst_boost + ' to the factor.' }),
+      h('p', { class: 'sub', text: 'Each farm step states its expected value under one stated assumption: a 5% community allocation of the implied value, split across about 50,000 farmers. The value steps are ordered by that expected value, highest first, so the first move is the move worth the most.' }),
       h('h3', { text: 'Comparable multiples by category' }),
       h('table', { class: 'comps' },
         h('thead', null, h('tr', null,
@@ -572,16 +675,29 @@
       h('p', { class: 'sub', text: verdict })
     ));
 
+    dialog.appendChild(h('section', { class: 'detail-section' },
+      h('h3', { text: 'Sector signals — where it stands against its own category' }),
+      h('div', { class: 'equation' },
+        equationRow('TVL z-score (log TVL vs its sector)', fmtZ(row.tvl_z)),
+        equationRow('Growth z-score (winsorised 7d vs its sector)', fmtZ(row.growth_z)),
+        equationRow('Sector z-score (its category multiple vs the market)', fmtZ(row.sector_z)),
+        equationRow('Momentum vs its sector median', (row.momentum_pct >= 0 ? '+' : '') + row.momentum_pct.toFixed(2) + ' pts'),
+        equationRow('Catalyst', row.catalyst ? catalystShort(row.catalyst, row) : 'none'),
+        equationRow('Signal multiplier', fmtMult(row.signal_multiplier))
+      ),
+      h('p', { class: 'sub', text: 'Z-scores are measured against the other protocols in this row’s own category, from this snapshot alone. A positive TVL z-score means it is large for its sector; a positive growth z-score means it grows faster than its sector; the signal multiplier folds both, plus any catalyst, into the implied value above.' })
+    ));
+
     var steps = farmSteps(row);
     dialog.appendChild(h('section', { class: 'detail-section' },
-      h('h3', { text: 'Farm plan' }),
+      h('h3', { text: 'Farm plan — steps ordered by expected value, highest first' }),
       h('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
         var tail = at >= 0 ? s.slice(at + 1) : '';
         return h('li', null, h('b', { text: action }), h('span', { class: 'cost', text: tail }));
       })),
-      h('p', { class: 'note' }, h('b', { text: 'Note: ' }), 'this protocol records no token in the snapshot. That is a record, not proof — check its own docs before assuming a launch, and never pay to claim.')
+      h('p', { class: 'note' }, h('b', { text: 'Note: ' }), 'this protocol records no token in the snapshot. That is a record, not proof — check its own docs before assuming a launch, and never pay to claim. Expected values assume a 5% community allocation of the implied value split across about 50,000 farmers.')
     ));
 
     if (typeof dialog.showModal === 'function') {
@@ -599,6 +715,7 @@
     shell.appendChild(header());
     shell.appendChild(lede());
     if (state.tab === 'pre-token') shell.appendChild(podium());
+    if (state.tab === 'pre-token') shell.appendChild(conviction());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') {

@@ -186,3 +186,22 @@ tbody tr:last-child td { border-bottom: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* Conviction: the top ten, one thesis line each, each opening its detail view. */
+.conviction { margin-top: 0; margin-bottom: var(--s4); padding: var(--s5); display: grid; gap: var(--s3); }
+.conviction h2 { font-size: 19px; }
+.conviction p { color: var(--muted); max-width: 78ch; }
+.thesis-list { margin: 0; padding-left: 0; list-style: none; display: grid; gap: var(--s2); counter-reset: thesis; }
+.thesis-list li { border-top: 1px solid var(--border); padding-top: var(--s2); }
+.thesis-list li:first-child { border-top: 0; padding-top: 0; }
+.thesis { display: flex; align-items: baseline; gap: var(--s3); width: 100%; text-align: left; border: 0; background: none; padding: 2px 0; color: var(--ink); }
+.thesis:hover .thesis-text { color: var(--accent); }
+.thesis-text { font-size: 14px; line-height: 1.5; color: var(--ink); }
+
+/* Signal column: the sector-relative factor, with a catalyst chip when one is present. */
+td.signal { font-family: var(--font-num); }
+td.signal .catalyst {
+  display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+  background: #2a2113; border: 1px solid var(--amber); color: var(--amber);
+  font-size: 11px; font-family: var(--font-num); white-space: nowrap;
+}
